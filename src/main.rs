@@ -54,6 +54,44 @@ impl State {
             }
         }
     }
+
+    /// Removes notification entries for panes that no longer exist.
+    /// Called on every PaneUpdate to handle pane closures.
+    fn cleanup_stale_panes(&mut self) {
+        // Collect all current pane IDs from all tabs
+        let current_pane_ids: HashSet<u32> = self
+            .panes
+            .panes
+            .values()
+            .flat_map(|panes| panes.iter().map(|p| p.id))
+            .collect();
+
+        // Track if any notifications were removed
+        let initial_count = self.notification_state.len();
+
+        // Remove notifications for panes that no longer exist
+        self.notification_state.retain(|pane_id, _| {
+            let exists = current_pane_ids.contains(pane_id);
+            if !exists {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "zellij-attention: Removing notification for closed pane {}",
+                    pane_id
+                );
+            }
+            exists
+        });
+
+        // Persist if any notifications were removed
+        if self.notification_state.len() != initial_count {
+            let persisted = PersistedState {
+                notifications: self.notification_state.clone(),
+            };
+            if let Err(e) = save_state(&persisted) {
+                eprintln!("zellij-attention: Failed to save state: {}", e);
+            }
+        }
+    }
 }
 
 impl ZellijPlugin for State {
@@ -93,6 +131,7 @@ impl ZellijPlugin for State {
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.panes = pane_manifest;
+                self.cleanup_stale_panes();
                 self.check_and_clear_focus();
                 #[cfg(debug_assertions)]
                 eprintln!(
@@ -107,11 +146,13 @@ impl ZellijPlugin for State {
 
     fn render(&mut self, _rows: usize, _cols: usize) {
         if self.permissions_granted {
+            let focused = self.determine_focused_pane();
             println!(
-                "zellij-attention: {} tabs, {} pane groups, {} notifications",
+                "Tabs: {} | Panes: {} | Notifications: {} | Focused: {:?}",
                 self.tabs.len(),
-                self.panes.panes.len(),
-                self.notification_state.len()
+                self.panes.panes.values().map(|p| p.len()).sum::<usize>(),
+                self.notification_state.len(),
+                focused
             );
         } else {
             println!("zellij-attention: Waiting for permissions...");
