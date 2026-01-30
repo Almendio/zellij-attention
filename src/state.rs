@@ -40,16 +40,16 @@ pub fn load_state() -> PersistedState {
         Ok(data) => {
             match bincode::serde::decode_from_slice(&data, bincode::config::standard()) {
                 Ok((state, _)) => state,
-                Err(e) => {
+                Err(_e) => {
                     #[cfg(debug_assertions)]
-                    eprintln!("zellij-attention: Failed to deserialize state: {}", e);
+                    eprintln!("zellij-attention: Failed to deserialize state: {}", _e);
                     PersistedState::default()
                 }
             }
         }
-        Err(e) => {
+        Err(_e) => {
             #[cfg(debug_assertions)]
-            eprintln!("zellij-attention: Failed to read state file: {}", e);
+            eprintln!("zellij-attention: Failed to read state file: {}", _e);
             PersistedState::default()
         }
     }

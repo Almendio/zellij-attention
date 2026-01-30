@@ -1,9 +1,16 @@
-use std::collections::BTreeMap;
+mod state;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
+
+use crate::state::{load_state, NotificationType};
 
 #[derive(Default)]
 struct State {
     permissions_granted: bool,
+    tabs: Vec<TabInfo>,
+    panes: PaneManifest,
+    notification_state: HashMap<u32, HashSet<NotificationType>>,
 }
 
 impl ZellijPlugin for State {
@@ -14,8 +21,15 @@ impl ZellijPlugin for State {
             PermissionType::ChangeApplicationState,
         ]);
 
-        // Subscribe to permission result event
-        subscribe(&[EventType::PermissionRequestResult]);
+        // Subscribe to events
+        subscribe(&[
+            EventType::PermissionRequestResult,
+            EventType::TabUpdate,
+            EventType::PaneUpdate,
+        ]);
+
+        // Load persisted state
+        self.notification_state = load_state().notifications;
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -27,14 +41,37 @@ impl ZellijPlugin for State {
                 self.permissions_granted = status == PermissionStatus::Granted;
                 true // Re-render to show updated status
             }
+            Event::TabUpdate(tab_info) => {
+                self.tabs = tab_info;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "zellij-attention: TabUpdate - {} tabs, active: {:?}",
+                    self.tabs.len(),
+                    self.tabs.iter().find(|t| t.active).map(|t| &t.name)
+                );
+                true // Will trigger render
+            }
+            Event::PaneUpdate(pane_manifest) => {
+                self.panes = pane_manifest;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "zellij-attention: PaneUpdate - {} tabs with panes",
+                    self.panes.panes.len()
+                );
+                true // Will trigger render
+            }
             _ => false,
         }
     }
 
-    fn render(&mut self, rows: usize, cols: usize) {
+    fn render(&mut self, _rows: usize, _cols: usize) {
         if self.permissions_granted {
-            println!("zellij-attention: Permissions granted - plugin ready");
-            println!("Pane size: {}x{}", cols, rows);
+            println!(
+                "zellij-attention: {} tabs, {} pane groups, {} notifications",
+                self.tabs.len(),
+                self.panes.panes.len(),
+                self.notification_state.len()
+            );
         } else {
             println!("zellij-attention: Waiting for permissions...");
         }
