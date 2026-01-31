@@ -2,7 +2,7 @@ mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
-use zellij_tile::shim::pipe_message_to_plugin;
+use zellij_tile::shim::{pipe_message_to_plugin, unblock_cli_pipe_input};
 
 use crate::state::{load_state, save_state, NotificationType, PersistedState};
 
@@ -348,6 +348,9 @@ impl ZellijPlugin for State {
 
         // Notify zjstatus
         self.send_to_zjstatus();
+
+        // Unblock the CLI pipe so the command returns
+        unblock_cli_pipe_input(&pipe_message.name);
 
         false // No need to render, we're invisible
     }
