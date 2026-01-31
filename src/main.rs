@@ -1,26 +1,10 @@
 mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use zellij_tile::prelude::*;
+use zellij_tile::shim::pipe_message_to_plugin;
 
 use crate::state::{load_state, save_state, NotificationType, PersistedState};
-
-/// Converts a PaletteColor to ANSI foreground color escape sequence.
-fn palette_color_to_ansi_fg(color: PaletteColor) -> String {
-    match color {
-        PaletteColor::Rgb((r, g, b)) => format!("\x1b[38;2;{};{};{}m", r, g, b),
-        PaletteColor::EightBit(idx) => format!("\x1b[38;5;{}m", idx),
-    }
-}
-
-/// Converts a PaletteColor to ANSI background color escape sequence.
-fn palette_color_to_ansi_bg(color: PaletteColor) -> String {
-    match color {
-        PaletteColor::Rgb((r, g, b)) => format!("\x1b[48;2;{};{};{}m", r, g, b),
-        PaletteColor::EightBit(idx) => format!("\x1b[48;5;{}m", idx),
-    }
-}
 
 /// JSON payload structure for pipe messages.
 /// External processes send: `zellij pipe --name notification -- '{"event_type":"waiting","pane_id":42}'`
@@ -30,14 +14,24 @@ struct PipeEvent {
     pane_id: u32,
 }
 
-#[derive(Default)]
 struct State {
     permissions_granted: bool,
     tabs: Vec<TabInfo>,
     panes: PaneManifest,
     notification_state: HashMap<u32, HashSet<NotificationType>>,
-    mode_info: ModeInfo,
-    tab_positions: Vec<(usize, usize)>, // (start_x, end_x) per tab for mouse clicks
+    zjstatus_url: String,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            permissions_granted: false,
+            tabs: Vec::new(),
+            panes: PaneManifest::default(),
+            notification_state: HashMap::new(),
+            zjstatus_url: "file:~/.config/zellij/plugins/zjstatus.wasm".to_string(),
+        }
+    }
 }
 
 impl State {
@@ -61,7 +55,7 @@ impl State {
     }
 
     /// Checks if focused pane has notifications and clears them.
-    /// Persists state to disk if any notifications were cleared.
+    /// Persists state to disk and notifies zjstatus if any notifications were cleared.
     fn check_and_clear_focus(&mut self) {
         if let Some(focused_pane_id) = self.determine_focused_pane() {
             if self.notification_state.remove(&focused_pane_id).is_some() {
@@ -78,6 +72,9 @@ impl State {
                 if let Err(e) = save_state(&persisted) {
                     eprintln!("zellij-attention: Failed to save state: {}", e);
                 }
+
+                // Notify zjstatus
+                self.send_to_zjstatus();
             }
         }
     }
@@ -138,7 +135,7 @@ impl State {
             exists
         });
 
-        // Persist if any notifications were removed
+        // Persist and notify zjstatus if any notifications were removed
         if self.notification_state.len() != initial_count {
             let persisted = PersistedState {
                 notifications: self.notification_state.clone(),
@@ -146,50 +143,114 @@ impl State {
             if let Err(e) = save_state(&persisted) {
                 eprintln!("zellij-attention: Failed to save state: {}", e);
             }
+
+            // Notify zjstatus
+            self.send_to_zjstatus();
         }
+    }
+
+    /// Formats the current notification state as a summary string for zjstatus.
+    /// Returns format like "! 2, 4" for waiting tabs, "* 3" for completed, or combined.
+    fn format_notification_summary(&self) -> String {
+        let mut waiting_tabs: Vec<usize> = Vec::new();
+        let mut completed_tabs: Vec<usize> = Vec::new();
+
+        for tab in &self.tabs {
+            if let Some(notification) = self.get_tab_notification_state(tab.position) {
+                match notification {
+                    NotificationType::Waiting => waiting_tabs.push(tab.position + 1),
+                    NotificationType::Completed => completed_tabs.push(tab.position + 1),
+                }
+            }
+        }
+
+        // Format output: "! 2, 4 * 3" means tabs 2,4 waiting, tab 3 completed
+        let mut parts: Vec<String> = Vec::new();
+        if !waiting_tabs.is_empty() {
+            let tabs = waiting_tabs
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("! {}", tabs));
+        }
+        if !completed_tabs.is_empty() {
+            let tabs = completed_tabs
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("* {}", tabs));
+        }
+
+        parts.join(" ")
+    }
+
+    /// Sends the current notification state to zjstatus via pipe.
+    fn send_to_zjstatus(&self) {
+        let summary = self.format_notification_summary();
+        let message_name = format!("zjstatus::pipe::claude::{}", summary);
+
+        #[cfg(debug_assertions)]
+        eprintln!("zellij-attention: Sending to zjstatus: {}", message_name);
+
+        pipe_message_to_plugin(
+            MessageToPlugin::new(&message_name).with_plugin_url(&self.zjstatus_url),
+        );
     }
 }
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
         // Request permissions needed for tab/pane state
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
         ]);
 
-        // Subscribe to all events upfront
-        // (Can't call subscribe() from update() - causes double-borrow panic)
+        // Subscribe to events (no Mouse needed anymore)
         subscribe(&[
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
             EventType::PaneUpdate,
-            EventType::ModeUpdate,
-            EventType::Mouse,
         ]);
 
         // Load persisted state
         self.notification_state = load_state().notifications;
 
-        eprintln!("zellij-attention: loaded\n");
+        // Allow override of zjstatus URL via configuration
+        if let Some(url) = configuration.get("zjstatus_url") {
+            self.zjstatus_url = url.clone();
+        }
+
+        eprintln!("zellij-attention: loaded, zjstatus_url={}\n", self.zjstatus_url);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(status) => {
                 self.permissions_granted = status == PermissionStatus::Granted;
-                // Tab-bar plugins should not be selectable
-                // This also gives us the full row for content (pane_content_rows: 1)
+                // Plugin should not be selectable (runs as background)
                 set_selectable(false);
-                eprintln!("zellij-attention: permissions={}, selectable=false\n", self.permissions_granted);
+                eprintln!(
+                    "zellij-attention: permissions={}, selectable=false\n",
+                    self.permissions_granted
+                );
+
+                // Send initial state to zjstatus
+                self.send_to_zjstatus();
                 true
             }
             Event::TabUpdate(tab_info) => {
                 self.tabs = tab_info;
                 self.check_and_clear_focus();
+
+                // Tab list changed, update zjstatus
+                self.send_to_zjstatus();
+
                 #[cfg(debug_assertions)]
                 eprintln!("zellij-attention: TabUpdate - {} tabs", self.tabs.len());
-                true // Will trigger render
+                false // No need to render, we're invisible
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.panes = pane_manifest;
@@ -200,125 +261,21 @@ impl ZellijPlugin for State {
                     "zellij-attention: PaneUpdate - {} tabs with panes",
                     self.panes.panes.len()
                 );
-                true // Will trigger render
-            }
-            Event::ModeUpdate(mode_info) => {
-                self.mode_info = mode_info;
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "zellij-attention: ModeUpdate - mode: {:?}",
-                    self.mode_info.mode
-                );
-                true // Re-render (theme may have changed)
-            }
-            Event::Mouse(mouse_event) => {
-                match mouse_event {
-                    Mouse::LeftClick(_row, col) => {
-                        let col = col as usize;
-                        // Find which tab was clicked based on tab_positions
-                        for (idx, (start, end)) in self.tab_positions.iter().enumerate() {
-                            if col >= *start && col < *end {
-                                // go_to_tab is 1-indexed, tab indices are 0-indexed
-                                go_to_tab((idx + 1) as u32);
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    _ => false, // Ignore other mouse events
-                }
+                false // No need to render, we're invisible
             }
             _ => false,
         }
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
-        // Clear tab positions at start of each render
-        self.tab_positions.clear();
-
-        if !self.permissions_granted {
-            print!("Waiting for permissions...");
-            let _ = std::io::stdout().flush();
-            return;
-        }
-
-        if self.tabs.is_empty() {
-            return;
-        }
-
-        let colors = &self.mode_info.style.colors;
-        let mut output = String::new();
-        let mut current_x = 0;
-
-        for tab in &self.tabs {
-            // Get notification state for this tab
-            let notification = self.get_tab_notification_state(tab.position);
-
-            // Build indicator string
-            let indicator = match notification {
-                Some(NotificationType::Waiting) => " !",
-                Some(NotificationType::Completed) => " *",
-                None => "",
-            };
-
-            // Build tab text: " {position+1}:{name}{indicator} "
-            let tab_text = format!(" {}:{}{} ", tab.position + 1, tab.name, indicator);
-            let tab_width = tab_text.chars().count();
-
-            // Check if this tab would overflow terminal width
-            if current_x + tab_width > cols {
-                break;
-            }
-
-            // Choose colors based on active state
-            let (fg_color, bg_color) = if tab.active {
-                (colors.ribbon_selected.base, colors.ribbon_selected.background)
-            } else {
-                (colors.ribbon_unselected.base, colors.ribbon_unselected.background)
-            };
-
-            let fg = palette_color_to_ansi_fg(fg_color);
-            let bg = palette_color_to_ansi_bg(bg_color);
-
-            // If there's a notification, colorize the indicator portion
-            if let Some(notification_type) = notification {
-                let main_text = format!(" {}:{}", tab.position + 1, tab.name);
-                let indicator_color = match notification_type {
-                    NotificationType::Waiting => {
-                        palette_color_to_ansi_fg(colors.exit_code_error.base)
-                    }
-                    NotificationType::Completed => {
-                        palette_color_to_ansi_fg(colors.exit_code_success.base)
-                    }
-                };
-                output.push_str(&format!(
-                    "{}{}{}{}{} \x1b[0m",
-                    bg, fg, main_text, indicator_color, indicator
-                ));
-            } else {
-                output.push_str(&format!("{}{}{}\x1b[0m", bg, fg, tab_text));
-            }
-
-            // Track tab position for mouse clicks
-            self.tab_positions.push((current_x, current_x + tab_width));
-            current_x += tab_width;
-        }
-
-        // Fill remaining space with background color
-        if current_x < cols {
-            let bg = palette_color_to_ansi_bg(colors.ribbon_unselected.background);
-            output.push_str(&format!("{}{}\x1b[0m", bg, " ".repeat(cols - current_x)));
-        }
-
-        // Clear to end of line and print
-        output.push_str("\x1b[0K");
-        print!("{}", output);
-        let _ = std::io::stdout().flush();
+    fn render(&mut self, _rows: usize, _cols: usize) {
+        // Plugin runs as backend for zjstatus, no visible UI needed
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        eprintln!("zellij-attention: pipe name={} payload={:?} args={:?}\n",
-            pipe_message.name, pipe_message.payload, pipe_message.args);
+        eprintln!(
+            "zellij-attention: pipe name={} payload={:?} args={:?}\n",
+            pipe_message.name, pipe_message.payload, pipe_message.args
+        );
 
         // Only handle messages to "notification" pipe, silently ignore others
         if pipe_message.name != "notification" {
@@ -388,7 +345,10 @@ impl ZellijPlugin for State {
             eprintln!("zellij-attention: Failed to save state: {}", e);
         }
 
-        true // Trigger re-render
+        // Notify zjstatus
+        self.send_to_zjstatus();
+
+        false // No need to render, we're invisible
     }
 }
 
