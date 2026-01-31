@@ -163,6 +163,7 @@ impl ZellijPlugin for State {
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::ModeUpdate,
+            EventType::Mouse,
         ]);
 
         // Load persisted state
@@ -204,6 +205,23 @@ impl ZellijPlugin for State {
                     self.mode_info.mode
                 );
                 true // Re-render (theme may have changed)
+            }
+            Event::Mouse(mouse_event) => {
+                match mouse_event {
+                    Mouse::LeftClick(_row, col) => {
+                        let col = col as usize;
+                        // Find which tab was clicked based on tab_positions
+                        for (idx, (start, end)) in self.tab_positions.iter().enumerate() {
+                            if col >= *start && col < *end {
+                                // go_to_tab is 1-indexed, tab indices are 0-indexed
+                                go_to_tab((idx + 1) as u32);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false, // Ignore other mouse events
+                }
             }
             _ => false,
         }
