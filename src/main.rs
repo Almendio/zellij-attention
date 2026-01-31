@@ -19,6 +19,7 @@ struct State {
     tabs: Vec<TabInfo>,
     panes: PaneManifest,
     notification_state: HashMap<u32, HashSet<NotificationType>>,
+    mode_info: ModeInfo,
 }
 
 impl State {
@@ -115,6 +116,7 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::ModeUpdate,
         ]);
 
         // Load persisted state
@@ -147,6 +149,15 @@ impl ZellijPlugin for State {
                     self.panes.panes.len()
                 );
                 true // Will trigger render
+            }
+            Event::ModeUpdate(mode_info) => {
+                self.mode_info = mode_info;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "zellij-attention: ModeUpdate - mode: {:?}",
+                    self.mode_info.mode
+                );
+                true // Re-render (theme may have changed)
             }
             _ => false,
         }
