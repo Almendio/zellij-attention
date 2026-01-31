@@ -5,6 +5,14 @@ use zellij_tile::prelude::*;
 
 use crate::state::{load_state, save_state, NotificationType, PersistedState};
 
+/// JSON payload structure for pipe messages.
+/// External processes send: `zellij pipe --name notification -- '{"event_type":"waiting","pane_id":42}'`
+#[derive(Debug, serde::Deserialize)]
+struct PipeEvent {
+    event_type: String,
+    pane_id: u32,
+}
+
 #[derive(Default)]
 struct State {
     permissions_granted: bool,
@@ -157,6 +165,61 @@ impl ZellijPlugin for State {
         } else {
             println!("zellij-attention: Waiting for permissions...");
         }
+    }
+
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        // Only handle messages to "notification" pipe, silently ignore others
+        if pipe_message.name != "notification" {
+            return false;
+        }
+
+        // Extract payload, log error if missing
+        let payload = match pipe_message.payload {
+            Some(p) => p,
+            None => {
+                eprintln!("zellij-attention: No payload in pipe message");
+                return false;
+            }
+        };
+
+        // Parse JSON payload
+        let event: PipeEvent = match serde_json::from_str(&payload) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("zellij-attention: Failed to parse pipe payload: {}", e);
+                return false;
+            }
+        };
+
+        // Normalize event_type to lowercase and match
+        let notification_type = match event.event_type.to_lowercase().as_str() {
+            "waiting" => NotificationType::Waiting,
+            "completed" => NotificationType::Completed,
+            unknown => {
+                eprintln!("zellij-attention: Unknown event type: {}", unknown);
+                return false;
+            }
+        };
+
+        // Latest wins: create new HashSet with single entry, replacing any existing
+        let mut notifications = HashSet::new();
+        notifications.insert(notification_type);
+        self.notification_state.insert(event.pane_id, notifications);
+
+        eprintln!(
+            "zellij-attention: Set pane {} to {:?}",
+            event.pane_id, notification_type
+        );
+
+        // Persist state change
+        let persisted = PersistedState {
+            notifications: self.notification_state.clone(),
+        };
+        if let Err(e) = save_state(&persisted) {
+            eprintln!("zellij-attention: Failed to save state: {}", e);
+        }
+
+        true // Trigger re-render
     }
 }
 
