@@ -202,10 +202,11 @@ impl State {
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Request permissions needed for tab/pane state
+        // Request permissions needed for tab/pane state and inter-plugin communication
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         // Subscribe to events (no Mouse needed anymore)
