@@ -5,6 +5,22 @@ use zellij_tile::prelude::*;
 
 use crate::state::{load_state, save_state, NotificationType, PersistedState};
 
+/// Converts a PaletteColor to ANSI foreground color escape sequence.
+fn palette_color_to_ansi_fg(color: PaletteColor) -> String {
+    match color {
+        PaletteColor::Rgb((r, g, b)) => format!("\u{1b}[38;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(idx) => format!("\u{1b}[38;5;{}m", idx),
+    }
+}
+
+/// Converts a PaletteColor to ANSI background color escape sequence.
+fn palette_color_to_ansi_bg(color: PaletteColor) -> String {
+    match color {
+        PaletteColor::Rgb((r, g, b)) => format!("\u{1b}[48;2;{};{};{}m", r, g, b),
+        PaletteColor::EightBit(idx) => format!("\u{1b}[48;5;{}m", idx),
+    }
+}
+
 /// JSON payload structure for pipe messages.
 /// External processes send: `zellij pipe --name notification -- '{"event_type":"waiting","pane_id":42}'`
 #[derive(Debug, serde::Deserialize)]
@@ -20,6 +36,7 @@ struct State {
     panes: PaneManifest,
     notification_state: HashMap<u32, HashSet<NotificationType>>,
     mode_info: ModeInfo,
+    tab_positions: Vec<(usize, usize)>, // (start_x, end_x) per tab for mouse clicks
 }
 
 impl State {
@@ -192,19 +209,109 @@ impl ZellijPlugin for State {
         }
     }
 
-    fn render(&mut self, _rows: usize, _cols: usize) {
-        if self.permissions_granted {
-            let focused = self.determine_focused_pane();
-            println!(
-                "Tabs: {} | Panes: {} | Notifications: {} | Focused: {:?}",
-                self.tabs.len(),
-                self.panes.panes.values().map(|p| p.len()).sum::<usize>(),
-                self.notification_state.len(),
-                focused
-            );
-        } else {
+    fn render(&mut self, _rows: usize, cols: usize) {
+        // Clear tab positions at start of each render
+        self.tab_positions.clear();
+
+        if !self.permissions_granted {
             println!("zellij-attention: Waiting for permissions...");
+            return;
         }
+
+        if self.tabs.is_empty() {
+            // Empty tab-bar: just fill with background color
+            let bg = palette_color_to_ansi_bg(
+                self.mode_info.style.colors.ribbon_unselected.background,
+            );
+            print!("{}{}\u{1b}[0K\u{1b}[0m", bg, " ".repeat(cols));
+            return;
+        }
+
+        let mut output = String::new();
+        let mut current_x = 0;
+
+        for tab in &self.tabs {
+            // Get notification state for this tab
+            let notification_state = self.get_tab_notification_state(tab.position);
+
+            // Build indicator string
+            let indicator = match notification_state {
+                Some(NotificationType::Waiting) => " !",
+                Some(NotificationType::Completed) => " *",
+                None => "",
+            };
+
+            // Build tab text: " {position+1}:{name}{indicator} "
+            let tab_text = format!(" {}:{}{} ", tab.position + 1, tab.name, indicator);
+            let tab_width = tab_text.chars().count();
+
+            // Check if this tab would overflow terminal width
+            if current_x + tab_width > cols {
+                break;
+            }
+
+            // Choose colors based on active state
+            let (fg_color, bg_color) = if tab.active {
+                (
+                    self.mode_info.style.colors.ribbon_selected.base,
+                    self.mode_info.style.colors.ribbon_selected.background,
+                )
+            } else {
+                (
+                    self.mode_info.style.colors.ribbon_unselected.base,
+                    self.mode_info.style.colors.ribbon_unselected.background,
+                )
+            };
+
+            // Format tab with colors
+            let fg = palette_color_to_ansi_fg(fg_color);
+            let bg = palette_color_to_ansi_bg(bg_color);
+
+            // If there's a notification, we need to colorize the indicator portion
+            if let Some(notification_type) = notification_state {
+                // Split tab_text into main part and indicator part
+                let main_text = format!(" {}:{}", tab.position + 1, tab.name);
+                let indicator_color = match notification_type {
+                    NotificationType::Waiting => {
+                        // Use error color (red semantic) for attention-seeking state
+                        palette_color_to_ansi_fg(self.mode_info.style.colors.exit_code_error.base)
+                    }
+                    NotificationType::Completed => {
+                        // Use success color (green semantic) for completed state
+                        palette_color_to_ansi_fg(self.mode_info.style.colors.exit_code_success.base)
+                    }
+                };
+
+                // Output: bg + fg + main_text + indicator_color + indicator + reset + space
+                output.push_str(&format!(
+                    "{}{}{}{}{} \u{1b}[0m",
+                    bg, fg, main_text, indicator_color, indicator
+                ));
+            } else {
+                // No notification, just output tab with base colors
+                output.push_str(&format!("{}{}{}\u{1b}[0m", bg, fg, tab_text));
+            }
+
+            // Track tab position for mouse clicks
+            let start_x = current_x;
+            let end_x = current_x + tab_width;
+            self.tab_positions.push((start_x, end_x));
+
+            current_x += tab_width;
+        }
+
+        // Fill remaining space with background color
+        if current_x < cols {
+            let bg = palette_color_to_ansi_bg(
+                self.mode_info.style.colors.ribbon_unselected.background,
+            );
+            let remaining = cols - current_x;
+            output.push_str(&format!("{}{}\u{1b}[0m", bg, " ".repeat(remaining)));
+        }
+
+        // Clear to end of line and print
+        output.push_str("\u{1b}[0K");
+        print!("{}", output);
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
