@@ -1,9 +1,11 @@
+mod config;
 mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
 use zellij_tile::shim::unblock_cli_pipe_input;
 
+use crate::config::NotificationConfig;
 use crate::state::{load_state, save_state, write_status, NotificationType, PersistedState};
 
 struct State {
@@ -12,6 +14,7 @@ struct State {
     panes: PaneManifest,
     notification_state: HashMap<u32, HashSet<NotificationType>>,
     zjstatus_url: String,
+    config: NotificationConfig,
 }
 
 impl Default for State {
@@ -22,6 +25,7 @@ impl Default for State {
             panes: PaneManifest::default(),
             notification_state: HashMap::new(),
             zjstatus_url: "file:~/.config/zellij/plugins/zjstatus.wasm".to_string(),
+            config: NotificationConfig::default(),
         }
     }
 }
@@ -142,8 +146,14 @@ impl State {
     }
 
     /// Formats the current notification state as a summary string for zjstatus.
-    /// Returns format like "! 2, 4" for waiting tabs, "* 3" for completed, or combined.
+    /// Returns format like "⏳ 2, 4" for waiting tabs, "✓ 3" for completed, or combined.
+    /// Uses configured icons and colors.
     fn format_notification_summary(&self) -> String {
+        // Early return if notifications are disabled
+        if !self.config.enabled {
+            return String::new();
+        }
+
         let mut waiting_tabs: Vec<usize> = Vec::new();
         let mut completed_tabs: Vec<usize> = Vec::new();
 
@@ -156,7 +166,7 @@ impl State {
             }
         }
 
-        // Format output: "! 2, 4 * 3" means tabs 2,4 waiting, tab 3 completed
+        // Format output with configured icons and colors
         let mut parts: Vec<String> = Vec::new();
         if !waiting_tabs.is_empty() {
             let tabs = waiting_tabs
@@ -164,7 +174,10 @@ impl State {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            parts.push(format!("! {}", tabs));
+            parts.push(format!(
+                "#[fg={}]{} {}",
+                self.config.waiting_color, self.config.waiting_icon, tabs
+            ));
         }
         if !completed_tabs.is_empty() {
             let tabs = completed_tabs
@@ -172,13 +185,16 @@ impl State {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            parts.push(format!("* {}", tabs));
+            parts.push(format!(
+                "#[fg={}]{} {}",
+                self.config.completed_color, self.config.completed_icon, tabs
+            ));
         }
 
         if parts.is_empty() {
             "#[fg=green]✓".to_string()
         } else {
-            format!("#[fg=red,bold]{}", parts.join(" "))
+            parts.join(" ")
         }
     }
 
@@ -222,6 +238,12 @@ impl ZellijPlugin for State {
 
         // Load persisted state
         self.notification_state = load_state().notifications;
+
+        // Parse configuration
+        self.config = NotificationConfig::from_configuration(&configuration);
+
+        #[cfg(debug_assertions)]
+        eprintln!("zellij-attention: config loaded: {:?}", self.config);
 
         // Allow override of zjstatus URL via configuration
         if let Some(url) = configuration.get("zjstatus_url") {
