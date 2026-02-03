@@ -192,7 +192,15 @@ impl State {
         }
 
         if parts.is_empty() {
-            "#[fg=green]✓".to_string()
+            // Only show "all clear" if there are truly no pending notifications
+            // During tab transitions, pane manifest might be incomplete, so
+            // notifications exist but don't map to tabs yet
+            if self.notification_state.is_empty() {
+                "#[fg=green]✓".to_string()
+            } else {
+                // Notifications exist but can't map to tabs yet - show pending indicator
+                format!("#[fg={}]{}", self.config.waiting_color, self.config.waiting_icon)
+            }
         } else {
             parts.join(" ")
         }
@@ -200,7 +208,13 @@ impl State {
 
     /// Writes the current notification state to a file for zjstatus to read.
     /// zjstatus polls this file using a command widget.
-    fn send_to_zjstatus(&self) {
+    ///
+    /// Note: Multiple plugin instances may exist. We re-read persisted state
+    /// to get the latest truth before writing, avoiding race conditions.
+    fn send_to_zjstatus(&mut self) {
+        // Re-read persisted state to get latest truth (other instances may have updated it)
+        self.notification_state = load_state().notifications;
+
         let summary = self.format_notification_summary();
 
         // Write status to file for zjstatus command widget
@@ -281,8 +295,15 @@ impl ZellijPlugin for State {
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.panes = pane_manifest;
-                self.cleanup_stale_panes();
+                // Note: cleanup_stale_panes() disabled - was causing notifications to
+                // disappear during tab transitions when pane manifest temporarily
+                // doesn't include all panes. Notifications clear on focus instead.
+                // self.cleanup_stale_panes();
                 self.check_and_clear_focus();
+
+                // Always update zjstatus to reflect current state
+                self.send_to_zjstatus();
+
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "zellij-attention: PaneUpdate - {} tabs with panes",

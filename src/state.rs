@@ -19,8 +19,10 @@ pub struct PersistedState {
     pub notifications: HashMap<u32, HashSet<NotificationType>>,
 }
 
-const STATE_PATH: &str = "/data/state.bin";
-const STATE_TMP_PATH: &str = "/data/state.bin.tmp";
+// Use /host/ for shared state across all plugin instances
+// /data/ is sandboxed per-instance, /host/ maps to cwd
+const STATE_PATH: &str = "/host/.zellij-attention-state.bin";
+const STATE_TMP_PATH: &str = "/host/.zellij-attention-state.bin.tmp";
 // Write to /host which maps to cwd where zellij started
 const STATUS_PATH: &str = "/host/.zellij-attention-status";
 
