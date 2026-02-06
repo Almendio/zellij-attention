@@ -3,17 +3,17 @@ mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
-use zellij_tile::shim::unblock_cli_pipe_input;
+use zellij_tile::shim::{rename_tab, unblock_cli_pipe_input};
 
 use crate::config::NotificationConfig;
-use crate::state::{load_state, save_state, write_status, NotificationType, PersistedState};
+use crate::state::{load_state, save_state, NotificationType, PersistedState};
 
 struct State {
     permissions_granted: bool,
     tabs: Vec<TabInfo>,
     panes: PaneManifest,
     notification_state: HashMap<u32, HashSet<NotificationType>>,
-    zjstatus_url: String,
+    original_tab_names: HashMap<usize, String>,
     config: NotificationConfig,
 }
 
@@ -24,7 +24,7 @@ impl Default for State {
             tabs: Vec::new(),
             panes: PaneManifest::default(),
             notification_state: HashMap::new(),
-            zjstatus_url: "file:~/.config/zellij/plugins/zjstatus.wasm".to_string(),
+            original_tab_names: HashMap::new(),
             config: NotificationConfig::default(),
         }
     }
@@ -51,7 +51,7 @@ impl State {
     }
 
     /// Checks if focused pane has notifications and clears them.
-    /// Persists state to disk and notifies zjstatus if any notifications were cleared.
+    /// Persists state to disk and updates tab names if any notifications were cleared.
     fn check_and_clear_focus(&mut self) {
         if let Some(focused_pane_id) = self.determine_focused_pane() {
             if self.notification_state.remove(&focused_pane_id).is_some() {
@@ -64,13 +64,14 @@ impl State {
                 // Persist state change
                 let persisted = PersistedState {
                     notifications: self.notification_state.clone(),
+                    original_tab_names: self.original_tab_names.clone(),
                 };
                 if let Err(e) = save_state(&persisted) {
                     eprintln!("zellij-attention: Failed to save state: {}", e);
                 }
 
-                // Notify zjstatus
-                self.send_to_zjstatus();
+                // Update tab names
+                self.update_tab_names();
             }
         }
     }
@@ -131,116 +132,111 @@ impl State {
             exists
         });
 
-        // Persist and notify zjstatus if any notifications were removed
+        // Persist and update tab names if any notifications were removed
         if self.notification_state.len() != initial_count {
             let persisted = PersistedState {
                 notifications: self.notification_state.clone(),
+                original_tab_names: self.original_tab_names.clone(),
             };
             if let Err(e) = save_state(&persisted) {
                 eprintln!("zellij-attention: Failed to save state: {}", e);
             }
 
-            // Notify zjstatus
-            self.send_to_zjstatus();
+            // Update tab names
+            self.update_tab_names();
         }
     }
 
-    /// Formats the current notification state as a summary string for zjstatus.
-    /// Returns format like "⏳ 2, 4" for waiting tabs, "✓ 3" for completed, or combined.
-    /// Uses configured icons and colors.
-    fn format_notification_summary(&self) -> String {
-        // Early return if notifications are disabled
+    /// Updates tab names to show notification icons or restore original names.
+    /// Directly renames tabs via Zellij API instead of using zjstatus file communication.
+    ///
+    /// Note: Multiple plugin instances may exist. We re-read persisted state
+    /// to get the latest truth before renaming, avoiding race conditions.
+    fn update_tab_names(&mut self) {
+        // Re-read persisted state for multi-instance coordination
+        let persisted = load_state();
+        self.notification_state = persisted.notifications;
+        self.original_tab_names = persisted.original_tab_names;
+
+        // Early return if disabled
         if !self.config.enabled {
-            return String::new();
+            return;
         }
 
-        let mut waiting_tabs: Vec<usize> = Vec::new();
-        let mut completed_tabs: Vec<usize> = Vec::new();
+        // Track which tab positions currently have notifications
+        // so we know which ones to restore
+        let mut notified_positions: HashSet<usize> = HashSet::new();
 
+        // Apply notification icons to tabs that need them
         for tab in &self.tabs {
             if let Some(notification) = self.get_tab_notification_state(tab.position) {
-                match notification {
-                    NotificationType::Waiting => waiting_tabs.push(tab.position + 1),
-                    NotificationType::Completed => completed_tabs.push(tab.position + 1),
+                notified_positions.insert(tab.position);
+
+                // Cache original name if not already cached
+                if !self.original_tab_names.contains_key(&tab.position) {
+                    let original = if tab.name.is_empty() {
+                        format!("Tab #{}", tab.position + 1)
+                    } else {
+                        tab.name.clone()
+                    };
+                    self.original_tab_names.insert(tab.position, original);
+                }
+
+                // Get the icon for this notification type
+                let icon = match notification {
+                    NotificationType::Waiting => &self.config.waiting_icon,
+                    NotificationType::Completed => &self.config.completed_icon,
+                };
+
+                // Build new name: "icon original_name"
+                let original = self.original_tab_names.get(&tab.position)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Tab #{}", tab.position + 1));
+                let new_name = format!("{} {}", icon, original);
+
+                rename_tab(tab.position as u32, &new_name);
+            }
+        }
+
+        // Restore original names for tabs that NO LONGER have notifications
+        // (i.e., they were previously renamed but notification was cleared)
+        let positions_to_restore: Vec<usize> = self.original_tab_names.keys()
+            .filter(|pos| !notified_positions.contains(pos))
+            .cloned()
+            .collect();
+
+        for pos in positions_to_restore {
+            if let Some(original_name) = self.original_tab_names.remove(&pos) {
+                // Only rename if tab still exists
+                if self.tabs.iter().any(|t| t.position == pos) {
+                    rename_tab(pos as u32, &original_name);
                 }
             }
         }
 
-        // Format output with configured icons and colors
-        let mut parts: Vec<String> = Vec::new();
-        if !waiting_tabs.is_empty() {
-            let tabs = waiting_tabs
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!(
-                "#[fg={}]{} {}",
-                self.config.waiting_color, self.config.waiting_icon, tabs
-            ));
+        // Clean up cached names for tabs that no longer exist
+        let valid_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
+        self.original_tab_names.retain(|pos, _| valid_positions.contains(pos));
+
+        // Persist updated state (includes original_tab_names)
+        let persisted = PersistedState {
+            notifications: self.notification_state.clone(),
+            original_tab_names: self.original_tab_names.clone(),
+        };
+        if let Err(e) = save_state(&persisted) {
+            eprintln!("zellij-attention: Failed to save state: {}", e);
         }
-        if !completed_tabs.is_empty() {
-            let tabs = completed_tabs
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!(
-                "#[fg={}]{} {}",
-                self.config.completed_color, self.config.completed_icon, tabs
-            ));
-        }
-
-        if parts.is_empty() {
-            // Only show "all clear" if there are truly no pending notifications
-            // During tab transitions, pane manifest might be incomplete, so
-            // notifications exist but don't map to tabs yet
-            if self.notification_state.is_empty() {
-                "#[fg=green]✓".to_string()
-            } else {
-                // Notifications exist but can't map to tabs yet - show pending indicator
-                format!("#[fg={}]{}", self.config.waiting_color, self.config.waiting_icon)
-            }
-        } else {
-            parts.join(" ")
-        }
-    }
-
-    /// Writes the current notification state to a file for zjstatus to read.
-    /// zjstatus polls this file using a command widget.
-    ///
-    /// Note: Multiple plugin instances may exist. We re-read persisted state
-    /// to get the latest truth before writing, avoiding race conditions.
-    fn send_to_zjstatus(&mut self) {
-        // Re-read persisted state to get latest truth (other instances may have updated it)
-        self.notification_state = load_state().notifications;
-
-        let summary = self.format_notification_summary();
-
-        // Write status to file for zjstatus command widget
-        if let Err(e) = write_status(&summary) {
-            eprintln!("zellij-attention: Failed to write status file: {}", e);
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "zellij-attention: State update: '{}' (tabs={}, notifications={:?})\n",
-            summary,
-            self.tabs.len(),
-            self.notification_state
-        );
     }
 }
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Request permissions needed for tab/pane state and inter-plugin communication
+        // Request permissions needed for tab/pane state and tab renaming
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::ReadCliPipes,
-            PermissionType::FullHdAccess,
         ]);
 
         // Subscribe to events (no Mouse needed anymore)
@@ -251,7 +247,9 @@ impl ZellijPlugin for State {
         ]);
 
         // Load persisted state
-        self.notification_state = load_state().notifications;
+        let persisted = load_state();
+        self.notification_state = persisted.notifications;
+        self.original_tab_names = persisted.original_tab_names;
 
         // Parse configuration
         self.config = NotificationConfig::from_configuration(&configuration);
@@ -259,12 +257,7 @@ impl ZellijPlugin for State {
         #[cfg(debug_assertions)]
         eprintln!("zellij-attention: config loaded: {:?}", self.config);
 
-        // Allow override of zjstatus URL via configuration
-        if let Some(url) = configuration.get("zjstatus_url") {
-            self.zjstatus_url = url.clone();
-        }
-
-        eprintln!("zellij-attention: loaded, zjstatus_url={}\n", self.zjstatus_url);
+        eprintln!("zellij-attention: loaded\n");
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -278,16 +271,16 @@ impl ZellijPlugin for State {
                     self.permissions_granted
                 );
 
-                // Send initial state to zjstatus
-                self.send_to_zjstatus();
+                // Update tab names with initial state
+                self.update_tab_names();
                 true
             }
             Event::TabUpdate(tab_info) => {
                 self.tabs = tab_info;
                 self.check_and_clear_focus();
 
-                // Tab list changed, update zjstatus
-                self.send_to_zjstatus();
+                // Tab list changed, update tab names
+                self.update_tab_names();
 
                 #[cfg(debug_assertions)]
                 eprintln!("zellij-attention: TabUpdate - {} tabs", self.tabs.len());
@@ -301,8 +294,8 @@ impl ZellijPlugin for State {
                 // self.cleanup_stale_panes();
                 self.check_and_clear_focus();
 
-                // Always update zjstatus to reflect current state
-                self.send_to_zjstatus();
+                // Always update tab names to reflect current state
+                self.update_tab_names();
 
                 #[cfg(debug_assertions)]
                 eprintln!(
@@ -386,13 +379,14 @@ impl ZellijPlugin for State {
         // Persist state change
         let persisted = PersistedState {
             notifications: self.notification_state.clone(),
+            original_tab_names: self.original_tab_names.clone(),
         };
         if let Err(e) = save_state(&persisted) {
             eprintln!("zellij-attention: Failed to save state: {}", e);
         }
 
-        // Notify zjstatus
-        self.send_to_zjstatus();
+        // Update tab names
+        self.update_tab_names();
 
         // Unblock the CLI pipe so the command returns
         unblock_cli_pipe_input(&pipe_message.name);
