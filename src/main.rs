@@ -113,11 +113,19 @@ impl State {
                 notified_positions.insert(tab.position);
 
                 if !self.original_tab_names.contains_key(&tab.position) {
-                    let original = if tab.name.is_empty() {
+                    let mut original = if tab.name.is_empty() {
                         format!("Tab #{}", tab.position + 1)
                     } else {
                         tab.name.clone()
                     };
+                    // Defensive: strip any trailing notification icons from stale tab.name
+                    // to prevent accumulation (e.g. "Name ⏳ ⏳" → "Name")
+                    for icon in [&self.config.waiting_icon, &self.config.completed_icon] {
+                        let suffix = format!(" {}", icon);
+                        while original.ends_with(&suffix) {
+                            original.truncate(original.len() - suffix.len());
+                        }
+                    }
                     self.original_tab_names.insert(tab.position, original);
                 }
 
@@ -208,10 +216,9 @@ impl ZellijPlugin for State {
             }
             Event::TabUpdate(tab_info) => {
                 self.tabs = tab_info;
-                // Only update tab names if a notification was cleared
-                if self.check_and_clear_focus() {
-                    self.update_tab_names();
-                }
+                // Don't clear notifications here — rename_tab() triggers TabUpdate,
+                // which would cause a set→clear→set race with stale tab names.
+                // Clearing only happens in PaneUpdate (actual user focus changes).
                 false
             }
             Event::PaneUpdate(pane_manifest) => {
