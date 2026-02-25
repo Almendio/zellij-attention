@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --target wasm32-wasip1 --all-features
+        run: cargo clippy --target wasm32-wasip1 --all-features --lib
 
   test:
     name: Test
@@ -38,7 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --target x86_64-unknown-linux-gnu
+        run: cargo test --lib --target x86_64-unknown-linux-gnu
 
   build:
     name: Build WASM

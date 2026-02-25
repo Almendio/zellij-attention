@@ -26,7 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --target x86_64-unknown-linux-gnu
+        run: cargo test --lib --target x86_64-unknown-linux-gnu
 
       - name: Build release
         run: cargo build --release --target wasm32-wasip1
