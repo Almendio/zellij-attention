@@ -9,7 +9,7 @@ use zellij_tile::prelude::*;
 use zellij_tile::shim::{rename_tab, unblock_cli_pipe_input};
 
 use crate::config::NotificationConfig;
-use crate::state::{load_state, save_state, NotificationType, PersistedState};
+use crate::state::NotificationType;
 
 #[derive(Default)]
 pub struct State {
@@ -20,6 +20,9 @@ pub struct State {
     pub(crate) original_tab_names: HashMap<usize, String>,
     pub(crate) config: NotificationConfig,
     updating_tabs: bool,
+    /// Tab positions where we've issued a rename to strip stale icons.
+    /// Prevents re-stripping on the bounced TabUpdate before Zellij catches up.
+    pub(crate) pending_strips: HashSet<usize>,
 }
 
 impl State {
@@ -44,7 +47,6 @@ impl State {
                     "zellij-attention: Cleared notifications for focused pane {}",
                     focused_pane_id
                 );
-                self.persist_state();
                 return true;
             }
         }
@@ -85,7 +87,6 @@ impl State {
             );
         }
 
-        self.persist_state();
         true
     }
 
@@ -105,6 +106,9 @@ impl State {
             }
             if self.original_tab_names.contains_key(&tab.position) {
                 continue; // will be handled by restore logic
+            }
+            if self.pending_strips.contains(&tab.position) {
+                continue; // already issued a strip, waiting for Zellij to catch up
             }
             if self.tab_name_has_icon(&tab.name) {
                 return true;
@@ -155,16 +159,6 @@ impl State {
             Some(NotificationType::Completed)
         } else {
             None
-        }
-    }
-
-    fn persist_state(&self) {
-        let persisted = PersistedState {
-            notifications: self.notification_state.clone(),
-            original_tab_names: self.original_tab_names.clone(),
-        };
-        if let Err(e) = save_state(&persisted) {
-            eprintln!("zellij-attention: Failed to save state: {}", e);
         }
     }
 
@@ -239,9 +233,18 @@ impl State {
         // but the plugin's state was lost or pane IDs changed.
         for tab in &self.tabs {
             if notified_positions.contains(&tab.position) {
+                self.pending_strips.remove(&tab.position);
                 continue;
             }
             if self.original_tab_names.contains_key(&tab.position) {
+                self.pending_strips.remove(&tab.position);
+                continue;
+            }
+            if self.pending_strips.contains(&tab.position) {
+                if !self.tab_name_has_icon(&tab.name) {
+                    // Zellij caught up, name is clean now
+                    self.pending_strips.remove(&tab.position);
+                }
                 continue;
             }
             if self.tab_name_has_icon(&tab.name) {
@@ -250,6 +253,7 @@ impl State {
                     "zellij-attention: Stripping stale icon from tab pos={} '{}' -> '{}'",
                     tab.position, tab.name, clean_name
                 );
+                self.pending_strips.insert(tab.position);
                 rename_tab((tab.position + 1) as u32, &clean_name);
             }
         }
@@ -259,10 +263,8 @@ impl State {
         if !self.tabs.is_empty() {
             let valid_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
             self.original_tab_names.retain(|pos, _| valid_positions.contains(pos));
+            self.pending_strips.retain(|pos| valid_positions.contains(pos));
         }
-
-        // Persist original_tab_names changes
-        self.persist_state();
 
         self.updating_tabs = false;
     }
@@ -275,7 +277,6 @@ impl ZellijPlugin for State {
             PermissionType::ChangeApplicationState,
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::ReadCliPipes,
-            PermissionType::FullHdAccess,
         ]);
 
         subscribe(&[
@@ -284,13 +285,9 @@ impl ZellijPlugin for State {
             EventType::PaneUpdate,
         ]);
 
-        let persisted = load_state();
-        self.notification_state = persisted.notifications;
-        self.original_tab_names = persisted.original_tab_names;
-
         self.config = NotificationConfig::from_configuration(&configuration);
 
-        eprintln!("zellij-attention: loaded\n");
+        eprintln!("zellij-attention: v{} loaded\n", env!("CARGO_PKG_VERSION"));
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -299,7 +296,7 @@ impl ZellijPlugin for State {
                 self.permissions_granted = status == PermissionStatus::Granted;
                 set_selectable(false);
 
-                // Apply any persisted notifications on startup
+                // Strip any stale icons on startup
                 self.update_tab_names();
                 true
             }
@@ -379,6 +376,10 @@ impl ZellijPlugin for State {
             }
         };
 
+        // Unblock the CLI pipe immediately so the caller never hangs,
+        // regardless of what happens during state mutation or tab renaming.
+        unblock_cli_pipe_input(&pipe_message.name);
+
         let mut notifications = HashSet::new();
         notifications.insert(notification_type);
         self.notification_state.insert(pane_id, notifications);
@@ -407,12 +408,7 @@ impl ZellijPlugin for State {
             }
         }
 
-        // Persist and update tab names
-        self.persist_state();
         self.update_tab_names();
-
-        // Unblock the CLI pipe so the command returns
-        unblock_cli_pipe_input(&pipe_message.name);
 
         false
     }
