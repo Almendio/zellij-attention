@@ -17,7 +17,6 @@ pub struct State {
     pub(crate) tabs: Vec<TabInfo>,
     pub(crate) panes: PaneManifest,
     pub(crate) notification_state: HashMap<u32, HashSet<NotificationType>>,
-    pub(crate) original_tab_names: HashMap<usize, String>,
     pub(crate) config: NotificationConfig,
     updating_tabs: bool,
     /// Tab positions where we've issued a rename to strip stale icons.
@@ -26,31 +25,35 @@ pub struct State {
 }
 
 impl State {
-    fn determine_focused_pane(&self) -> Option<u32> {
-        let active_tab = self.tabs.iter().find(|t| t.active)?;
-        let panes = self.panes.panes.get(&active_tab.position)?;
-        let focused = panes.iter().find(|p| {
-            !p.is_plugin
-                && p.is_focused
-                && (p.is_floating == active_tab.are_floating_panes_visible)
-        })?;
-        Some(focused.id)
-    }
-
-    /// Checks if focused pane has notifications and clears them.
+    /// Checks if any focused pane (across all clients) has notifications and clears them.
+    /// With multiple clients attached, each has its own active tab, so we must
+    /// iterate ALL active tabs — not just the first one found.
     /// Returns true if any notification was cleared.
     pub(crate) fn check_and_clear_focus(&mut self) -> bool {
-        if let Some(focused_pane_id) = self.determine_focused_pane() {
-            if self.notification_state.remove(&focused_pane_id).is_some() {
+        let focused_panes: Vec<u32> = self.tabs.iter()
+            .filter(|t| t.active)
+            .filter_map(|active_tab| {
+                let panes = self.panes.panes.get(&active_tab.position)?;
+                panes.iter().find(|p| {
+                    !p.is_plugin
+                        && p.is_focused
+                        && (p.is_floating == active_tab.are_floating_panes_visible)
+                }).map(|p| p.id)
+            })
+            .collect();
+
+        let mut cleared = false;
+        for pane_id in focused_panes {
+            if self.notification_state.remove(&pane_id).is_some() {
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "zellij-attention: Cleared notifications for focused pane {}",
-                    focused_pane_id
+                    pane_id
                 );
-                return true;
+                cleared = true;
             }
         }
-        false
+        cleared
     }
 
     /// Removes notification entries for pane IDs that no longer exist.
@@ -90,22 +93,11 @@ impl State {
         true
     }
 
-    /// Returns true if there are original_tab_names entries waiting to be
-    /// restored (i.e., their tab positions have no active notifications).
-    pub(crate) fn has_pending_restores(&self) -> bool {
-        self.original_tab_names.keys().any(|pos| {
-            self.get_tab_notification_state(*pos).is_none()
-        })
-    }
-
     /// Returns true if any tab has a stale icon suffix with no active notification.
     pub(crate) fn has_stale_icons(&self) -> bool {
         for tab in &self.tabs {
             if self.get_tab_notification_state(tab.position).is_some() {
                 continue;
-            }
-            if self.original_tab_names.contains_key(&tab.position) {
-                continue; // will be handled by restore logic
             }
             if self.pending_strips.contains(&tab.position) {
                 continue; // already issued a strip, waiting for Zellij to catch up
@@ -162,107 +154,60 @@ impl State {
         }
     }
 
-    /// Updates tab names to show notification icons or restore original names.
-    /// Only called when notification state changes (pipe received, notification cleared).
-    /// Uses in-memory state — no disk I/O inside this method.
+    /// Updates tab names to reflect notification state.
+    /// Stateless: derives the desired name from the current tab name on every cycle.
+    /// No cached names — immune to tab reordering and position shifts.
     fn update_tab_names(&mut self) {
         if self.updating_tabs || !self.config.enabled {
             return;
         }
         self.updating_tabs = true;
 
-        let mut notified_positions: HashSet<usize> = HashSet::new();
-
         for tab in &self.tabs {
+            let base_name = if tab.name.is_empty() {
+                format!("Tab #{}", tab.position + 1)
+            } else {
+                self.strip_icons(&tab.name)
+            };
+
             if let Some(notification) = self.get_tab_notification_state(tab.position) {
-                notified_positions.insert(tab.position);
-
-                if !self.original_tab_names.contains_key(&tab.position) {
-                    let original = if tab.name.is_empty() {
-                        format!("Tab #{}", tab.position + 1)
-                    } else {
-                        // Strip any trailing notification icons from stale tab.name
-                        // to prevent accumulation (e.g. "Name ⏳ ⏳" → "Name")
-                        self.strip_icons(&tab.name)
-                    };
-                    self.original_tab_names.insert(tab.position, original);
-                }
-
+                // Tab HAS a notification — ensure icon is present
                 let icon = match notification {
                     NotificationType::Waiting => &self.config.waiting_icon,
                     NotificationType::Completed => &self.config.completed_icon,
                 };
+                let desired = format!("{} {}", base_name, icon);
 
-                let original = self.original_tab_names.get(&tab.position)
-                    .cloned()
-                    .unwrap_or_else(|| format!("Tab #{}", tab.position + 1));
-                let new_name = format!("{} {}", original, icon);
-
-                if tab.name != new_name {
+                if tab.name != desired {
                     #[cfg(debug_assertions)]
                     eprintln!(
                         "zellij-attention: RENAME tab pos={} '{}' -> '{}'",
-                        tab.position, tab.name, new_name
+                        tab.position, tab.name, desired
                     );
-                    // Zellij's RenameTab handler subtracts 1 (expects 1-indexed)
-                    rename_tab((tab.position + 1) as u32, &new_name);
+                    rename_tab((tab.position + 1) as u32, &desired);
                 }
-            }
-        }
-
-        // Restore original names for tabs whose notifications were cleared
-        let positions_to_restore: Vec<usize> = self.original_tab_names.keys()
-            .filter(|pos| !notified_positions.contains(pos))
-            .cloned()
-            .collect();
-
-        for pos in positions_to_restore {
-            if let Some(tab) = self.tabs.iter().find(|t| t.position == pos) {
-                if let Some(original_name) = self.original_tab_names.remove(&pos) {
-                    if tab.name != original_name {
-                        // Zellij's RenameTab handler subtracts 1 (expects 1-indexed)
-                        rename_tab((pos + 1) as u32, &original_name);
-                    }
-                }
-            }
-            // If tab not found yet (e.g. tabs not loaded), keep the entry for later
-        }
-
-        // Strip stale icons from tabs that have no notification and no pending restore.
-        // This handles the case where Zellij persisted renamed tab names across sessions
-        // but the plugin's state was lost or pane IDs changed.
-        for tab in &self.tabs {
-            if notified_positions.contains(&tab.position) {
                 self.pending_strips.remove(&tab.position);
-                continue;
-            }
-            if self.original_tab_names.contains_key(&tab.position) {
-                self.pending_strips.remove(&tab.position);
-                continue;
-            }
-            if self.pending_strips.contains(&tab.position) {
-                if !self.tab_name_has_icon(&tab.name) {
-                    // Zellij caught up, name is clean now
-                    self.pending_strips.remove(&tab.position);
+            } else if tab.name != base_name && self.tab_name_has_icon(&tab.name) {
+                // Tab has NO notification but has a stale icon — strip it
+                if self.pending_strips.contains(&tab.position) {
+                    // Already issued a strip, waiting for Zellij to catch up
+                    continue;
                 }
-                continue;
-            }
-            if self.tab_name_has_icon(&tab.name) {
-                let clean_name = self.strip_icons(&tab.name);
                 eprintln!(
                     "zellij-attention: Stripping stale icon from tab pos={} '{}' -> '{}'",
-                    tab.position, tab.name, clean_name
+                    tab.position, tab.name, base_name
                 );
                 self.pending_strips.insert(tab.position);
-                rename_tab((tab.position + 1) as u32, &clean_name);
+                rename_tab((tab.position + 1) as u32, &base_name);
+            } else {
+                // Name is clean (or user renamed to something without our icons)
+                self.pending_strips.remove(&tab.position);
             }
         }
 
-        // Clean up cached names for tabs that no longer exist
-        // Only clean up if we actually have tab data (avoid wiping on startup before tabs load)
+        // Clean up pending_strips for tab positions that no longer exist
         if !self.tabs.is_empty() {
             let valid_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
-            self.original_tab_names.retain(|pos, _| valid_positions.contains(pos));
             self.pending_strips.retain(|pos| valid_positions.contains(pos));
         }
 
@@ -304,8 +249,7 @@ impl ZellijPlugin for State {
                 self.tabs = tab_info;
                 let focus_cleared = self.check_and_clear_focus();
                 let stale_cleaned = self.clean_stale_notifications();
-                if focus_cleared || stale_cleaned || self.has_pending_restores()
-                    || self.has_stale_icons()
+                if focus_cleared || stale_cleaned || self.has_stale_icons()
                 {
                     self.update_tab_names();
                 }
@@ -315,8 +259,7 @@ impl ZellijPlugin for State {
                 self.panes = pane_manifest;
                 let focus_cleared = self.check_and_clear_focus();
                 let stale_cleaned = self.clean_stale_notifications();
-                if focus_cleared || stale_cleaned || self.has_pending_restores()
-                    || self.has_stale_icons()
+                if focus_cleared || stale_cleaned || self.has_stale_icons()
                 {
                     self.update_tab_names();
                 }

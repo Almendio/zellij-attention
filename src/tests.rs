@@ -79,11 +79,11 @@ fn test_has_stale_icons_ignores_active_notifications() {
 }
 
 #[test]
-fn test_has_stale_icons_ignores_pending_restores() {
+fn test_has_stale_icons_skips_pending_strips() {
     let mut state = State::default();
     state.tabs = vec![make_tab(0, "Tab 1 ⏳", true)];
     state.panes = make_manifest(vec![(0, vec![make_pane(1, false, true)])]);
-    state.original_tab_names.insert(0, "Tab 1".to_string());
+    state.pending_strips.insert(0);
 
     assert!(!state.has_stale_icons());
 }
@@ -120,17 +120,7 @@ fn test_stale_icons_after_restart_with_no_saved_state() {
         (1, vec![make_pane(2, false, false)]),
     ]);
 
-    assert!(!state.has_pending_restores());
     assert!(state.has_stale_icons());
-}
-
-#[test]
-fn test_original_tab_names_not_wiped_when_tabs_empty() {
-    let mut state = State::default();
-    state.original_tab_names.insert(0, "Tab 1".to_string());
-
-    assert!(state.tabs.is_empty());
-    assert!(state.original_tab_names.contains_key(&0));
 }
 
 #[test]
