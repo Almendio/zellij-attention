@@ -179,7 +179,6 @@ impl State {
                 let desired = format!("{} {}", base_name, icon);
 
                 if tab.name != desired {
-                    #[cfg(debug_assertions)]
                     eprintln!(
                         "zellij-attention: RENAME tab pos={} '{}' -> '{}'",
                         tab.position, tab.name, desired
@@ -246,6 +245,21 @@ impl ZellijPlugin for State {
                 true
             }
             Event::TabUpdate(tab_info) => {
+                // Detect external renames (base name changed by something other than us)
+                for new_tab in &tab_info {
+                    if let Some(old_tab) = self.tabs.iter().find(|t| t.position == new_tab.position) {
+                        if old_tab.name != new_tab.name {
+                            let old_base = self.strip_icons(&old_tab.name);
+                            let new_base = self.strip_icons(&new_tab.name);
+                            if old_base != new_base {
+                                eprintln!(
+                                    "zellij-attention: EXTERNAL rename at pos={} '{}' -> '{}' (base: '{}' -> '{}')",
+                                    new_tab.position, old_tab.name, new_tab.name, old_base, new_base
+                                );
+                            }
+                        }
+                    }
+                }
                 self.tabs = tab_info;
                 let focus_cleared = self.check_and_clear_focus();
                 let stale_cleaned = self.clean_stale_notifications();
