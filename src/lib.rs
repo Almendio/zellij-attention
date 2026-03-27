@@ -6,7 +6,7 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
-use zellij_tile::shim::{rename_tab, unblock_cli_pipe_input};
+use zellij_tile::shim::{get_plugin_ids, rename_tab, unblock_cli_pipe_input};
 
 use crate::config::NotificationConfig;
 use crate::state::NotificationType;
@@ -22,11 +22,14 @@ pub struct State {
     /// Tab positions where we've issued a rename to strip stale icons.
     /// Prevents re-stripping on the bounced TabUpdate before Zellij catches up.
     pub(crate) pending_strips: HashSet<usize>,
-    /// Cooldown counter per tab position after detecting an external base-name change.
-    /// Zellij spawns multiple plugin instances (one per client connection); when they
-    /// each call rename_tab() with different state snapshots, tab names bounce between
-    /// projects. Suppressing our renames for a few cycles lets the instances settle.
-    rename_cooldown: HashMap<usize, u8>,
+    /// This instance's Zellij client ID (set in load() via get_plugin_ids()).
+    my_client_id: u16,
+    /// Whether this instance is the primary (lowest client_id among connected clients).
+    /// Only the primary instance calls rename_tab() to prevent multi-instance fighting.
+    /// Zellij spawns one plugin instance per client connection; without this guard,
+    /// instances see different intermediate states during tab reorders and fight
+    /// over tab names, causing them to bounce between projects.
+    is_primary: bool,
 }
 
 impl State {
@@ -163,20 +166,12 @@ impl State {
     /// Stateless: derives the desired name from the current tab name on every cycle.
     /// No cached names — immune to tab reordering and position shifts.
     fn update_tab_names(&mut self) {
-        if self.updating_tabs || !self.config.enabled {
+        if self.updating_tabs || !self.config.enabled || !self.is_primary {
             return;
         }
         self.updating_tabs = true;
 
         for tab in &self.tabs {
-            // Skip positions on cooldown — another plugin instance is fighting over
-            // this tab's name. Wait for the state to settle.
-            if let Some(cd) = self.rename_cooldown.get(&tab.position) {
-                if *cd > 0 {
-                    continue;
-                }
-            }
-
             let base_name = if tab.name.is_empty() {
                 format!("Tab #{}", tab.position + 1)
             } else {
@@ -240,11 +235,21 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::SessionUpdate,
         ]);
 
         self.config = NotificationConfig::from_configuration(&configuration);
 
-        eprintln!("zellij-attention: v{} loaded\n", env!("CARGO_PKG_VERSION"));
+        let ids = get_plugin_ids();
+        self.my_client_id = ids.client_id;
+        // Default to primary until SessionUpdate tells us otherwise
+        self.is_primary = true;
+
+        eprintln!(
+            "zellij-attention: v{} loaded (client_id={})\n",
+            env!("CARGO_PKG_VERSION"),
+            self.my_client_id
+        );
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -258,35 +263,33 @@ impl ZellijPlugin for State {
                 true
             }
             Event::TabUpdate(tab_info) => {
-                // Detect external renames and set cooldowns to avoid multi-instance fighting.
-                // Zellij spawns one plugin instance per client connection; when multiple
-                // instances call rename_tab() with different state, names bounce.
-                // Decrement existing cooldowns first, then set new ones.
-                self.rename_cooldown.values_mut().for_each(|cd| *cd = cd.saturating_sub(1));
-                self.rename_cooldown.retain(|_, cd| *cd > 0);
-
-                for new_tab in &tab_info {
-                    if let Some(old_tab) = self.tabs.iter().find(|t| t.position == new_tab.position) {
-                        if old_tab.name != new_tab.name {
-                            let old_base = self.strip_icons(&old_tab.name);
-                            let new_base = self.strip_icons(&new_tab.name);
-                            if old_base != new_base {
-                                eprintln!(
-                                    "zellij-attention: EXTERNAL rename at pos={} '{}' -> '{}' (base: '{}' -> '{}')",
-                                    new_tab.position, old_tab.name, new_tab.name, old_base, new_base
-                                );
-                                // Back off for 5 cycles to let the other instance settle
-                                self.rename_cooldown.insert(new_tab.position, 5);
-                            }
-                        }
-                    }
-                }
                 self.tabs = tab_info;
                 let focus_cleared = self.check_and_clear_focus();
                 let stale_cleaned = self.clean_stale_notifications();
                 if focus_cleared || stale_cleaned || self.has_stale_icons()
                 {
                     self.update_tab_names();
+                }
+                false
+            }
+            Event::SessionUpdate(sessions, _) => {
+                // Dynamic primary election: only the instance with the lowest
+                // client_id among connected clients calls rename_tab().
+                // SessionInfo.tab_history keys are all active client IDs.
+                if let Some(session) = sessions.iter().find(|s| s.is_current_session) {
+                    let lowest = session.tab_history.keys().min().copied();
+                    let was_primary = self.is_primary;
+                    self.is_primary = lowest.map_or(true, |min_id| self.my_client_id == min_id);
+                    if was_primary != self.is_primary {
+                        eprintln!(
+                            "zellij-attention: client_id={} primary={} (lowest={})",
+                            self.my_client_id, self.is_primary, lowest.unwrap_or(0)
+                        );
+                    }
+                    // If we just became primary, apply any pending tab name updates
+                    if !was_primary && self.is_primary {
+                        self.update_tab_names();
+                    }
                 }
                 false
             }
