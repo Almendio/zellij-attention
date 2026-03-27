@@ -22,6 +22,11 @@ pub struct State {
     /// Tab positions where we've issued a rename to strip stale icons.
     /// Prevents re-stripping on the bounced TabUpdate before Zellij catches up.
     pub(crate) pending_strips: HashSet<usize>,
+    /// Cooldown counter per tab position after detecting an external base-name change.
+    /// Zellij spawns multiple plugin instances (one per client connection); when they
+    /// each call rename_tab() with different state snapshots, tab names bounce between
+    /// projects. Suppressing our renames for a few cycles lets the instances settle.
+    rename_cooldown: HashMap<usize, u8>,
 }
 
 impl State {
@@ -164,6 +169,14 @@ impl State {
         self.updating_tabs = true;
 
         for tab in &self.tabs {
+            // Skip positions on cooldown — another plugin instance is fighting over
+            // this tab's name. Wait for the state to settle.
+            if let Some(cd) = self.rename_cooldown.get(&tab.position) {
+                if *cd > 0 {
+                    continue;
+                }
+            }
+
             let base_name = if tab.name.is_empty() {
                 format!("Tab #{}", tab.position + 1)
             } else {
@@ -245,7 +258,13 @@ impl ZellijPlugin for State {
                 true
             }
             Event::TabUpdate(tab_info) => {
-                // Detect external renames (base name changed by something other than us)
+                // Detect external renames and set cooldowns to avoid multi-instance fighting.
+                // Zellij spawns one plugin instance per client connection; when multiple
+                // instances call rename_tab() with different state, names bounce.
+                // Decrement existing cooldowns first, then set new ones.
+                self.rename_cooldown.values_mut().for_each(|cd| *cd = cd.saturating_sub(1));
+                self.rename_cooldown.retain(|_, cd| *cd > 0);
+
                 for new_tab in &tab_info {
                     if let Some(old_tab) = self.tabs.iter().find(|t| t.position == new_tab.position) {
                         if old_tab.name != new_tab.name {
@@ -256,6 +275,8 @@ impl ZellijPlugin for State {
                                     "zellij-attention: EXTERNAL rename at pos={} '{}' -> '{}' (base: '{}' -> '{}')",
                                     new_tab.position, old_tab.name, new_tab.name, old_base, new_base
                                 );
+                                // Back off for 5 cycles to let the other instance settle
+                                self.rename_cooldown.insert(new_tab.position, 5);
                             }
                         }
                     }
